@@ -11,14 +11,7 @@ using System.Windows.Forms;
 
 namespace SQLCopyCompany
 {
-    public static class MiscExtensions
-    {
-        // Ex: collection.TakeLast(5);
-        public static IEnumerable<T> TakeLast<T>(this IEnumerable<T> source, int N)
-        {
-            return source.Skip(Math.Max(0, source.Count() - N));
-        }
-    }
+
     public partial class frmMain : Form
     {
 
@@ -30,6 +23,7 @@ namespace SQLCopyCompany
 
         //private List<string> log = new List<string>();
         private string logString = "";
+        private bool msgBoxShown = false;
         public frmMain()
         {
             InitializeComponent();
@@ -48,7 +42,8 @@ namespace SQLCopyCompany
         private void CmdShowLog_Click(object sender, EventArgs e)
         {
             //MessageBox.Show(string.Join(Environment.NewLine, log.TakeLast(2)));
-            MessageBox.Show(logString);
+            txtLog.Text = logString;
+            //MessageBox.Show(logString);
         }
 
         private void CmdTestSetup_Click(object sender, EventArgs e)
@@ -136,8 +131,36 @@ namespace SQLCopyCompany
             lblProgressValue.Text = e.UserState.ToString() + " " + e.ProgressPercentage + "%";
         }
 
+
+        public static string SqlDefaultValue(string dataType)
+        {
+            var sqlString = "";
+            switch (dataType)
+            {
+                case "datetime":
+                    return "'17530101'";
+                case "bigint":
+                case "decimal":
+                case "int":
+                case "tinyint":
+                    return "0";
+
+                case "nvarchar":
+                case "varchar":
+                    return "''";
+                case "uniqueidentifier":
+                    return Guid.Empty.ToString();
+                case "varbinary":
+                case "image":
+                    return "0x";
+
+            }
+            return sqlString;
+        }
         private void Go(object sender, DoWorkEventArgs e)
         {
+            int maxLines = 500;
+
             var worker = (BackgroundWorker)sender;
 
             worker.ReportProgress(0, "Started");
@@ -183,36 +206,63 @@ namespace SQLCopyCompany
                     if (reader.HasRows)
                     {
 
-                        var insertSQL = $"INSERT INTO [{targetCompany}${kvp.Key}] ([{string.Join("],[", kvp.Value)}]) VALUES ";
+                        string insertSQLStart;
+                        var targetColumns = ColumnsFromTable(targetConnection, kvp.Key, targetCompany).Where(v => !v.IsNullable).Except(kvp.Value, new LambdaComparer<SQLColumn>((x, y) =>
+                         {
+                             return x.Name.Equals(y.Name);
+                         }));
+
+
+                        string defaultVals = "";
+                        if (targetColumns.Count() > 0)
+                        {
+                            insertSQLStart = $"INSERT INTO [{targetCompany}${kvp.Key}] ([{string.Join("],[", kvp.Value)}],[{string.Join("],[", targetColumns)}]) VALUES ";
+
+                            defaultVals = string.Join(",", targetColumns.Select(x => SqlDefaultValue(x.DataType)));
+                        }
+                        else
+                        {
+                            insertSQLStart = $"INSERT INTO [{targetCompany}${kvp.Key}] ([{string.Join("],[", kvp.Value)}]) VALUES ";
+                        }
+                        var insertSQL = insertSQLStart;
                         var inserts = new List<string>();
                         while (reader.Read())
                         {
                             var vals = kvp.Value.ToList().Select(v => SqlValueString(reader[v.Name].ToString(), v.DataType));
-                            inserts.Add($"({string.Join(",", vals)})");
+                            if (!string.IsNullOrWhiteSpace(defaultVals))
+                            {
+                                inserts.Add($"({string.Join(",", vals)},{defaultVals})");
+                            }
+                            else
+                            {
+                                inserts.Add($"({string.Join(",", vals)})");
+                            }
 
                             c2++;
-                            if (c2 % 1000 == 0)
+                            if (c2 % maxLines == 0)
                             {
                                 worker.ReportProgress(progress, $"{sourceCompany}${kvp.Key} | still working {c2} |");
                                 insertSQL += string.Join($",{Environment.NewLine}", inserts);
                                 insertSqls.Add(insertSQL);
-                                insertSQL = $"INSERT INTO [{targetCompany}${kvp.Key}] ([{string.Join("],[", kvp.Value)}]) VALUES ";
+                                insertSQL = insertSQLStart;
                                 inserts.Clear();
                             }
                         }
-                        if (c2 % 1000 != 0)
+                        if (c2 % maxLines != 0)
                         {
                             insertSQL += string.Join($",{Environment.NewLine}", inserts);
                             insertSqls.Add(insertSQL);
                         }
                     }
                 }
-                //log.Add(string.Join(Environment.NewLine, insertSqls));
+
 
 
                 if (chkDeleteOldData.Checked)
                 {
-                    new SqlCommand($"DELETE FROM [{targetCompany}${kvp.Key}]", targetConnection) { CommandTimeout = 600 }.ExecuteNonQuery();
+                    var deleteSQL = $"DELETE FROM [{targetCompany}${kvp.Key}]";
+                    logString = deleteSQL;
+                    new SqlCommand(deleteSQL, targetConnection) { CommandTimeout = 600 }.ExecuteNonQuery();
                 }
                 int c3 = 0;
                 foreach (var insertSql in insertSqls)
@@ -221,7 +271,7 @@ namespace SQLCopyCompany
                     logString = insertSql;
                     worker.ReportProgress(progress, $"{sourceCompany}${kvp.Key} | still working {c3}/{c2} |");
                     new SqlCommand(insertSql, targetConnection) { CommandTimeout = 600 }.ExecuteNonQuery();
-                    c3 += 1000;
+                    c3 += maxLines;
                 }
                 counter++;
                 worker.ReportProgress(progress, kvp.Key);
@@ -240,7 +290,6 @@ namespace SQLCopyCompany
                     return $"'{value.Replace("'", "''")}'";
 
                 case "int":
-
                 case "timestamp":
                 case "varbinary":
                 case "uniqueidentifier":
@@ -248,7 +297,12 @@ namespace SQLCopyCompany
                 case "bigint":
                     return $"{value}";
                 case "decimal":
-                    return $"{value.Replace(',', '.')}";
+                    var val = $"{ value.Replace(',', '.') }";
+                    if (val.Equals("0.00000000000000000000"))
+                    {
+                        return "0.0";
+                    }
+                    return val;
             }
             return "";
         }
@@ -263,15 +317,14 @@ namespace SQLCopyCompany
             var columns = new List<SQLColumn>();
             var companyString = string.IsNullOrEmpty(company) ? string.Empty : company + "$";
 
-            var command = new SqlCommand($"select COLUMN_NAME,DATA_TYPE from INFORMATION_SCHEMA.COLUMNS where TABLE_NAME = '{companyString}{tableName}' AND COLUMN_NAME != 'timestamp'", conn);
+            var command = new SqlCommand($"select COLUMN_NAME,DATA_TYPE,IS_NULLABLE from INFORMATION_SCHEMA.COLUMNS where TABLE_NAME = '{companyString}{tableName}' AND COLUMN_NAME != 'timestamp'", conn);
             using (var reader = command.ExecuteReader())
             {
                 if (reader.HasRows)
                 {
                     while (reader.Read())
                     {
-
-                        columns.Add(new SQLColumn { Name = reader.GetString(0), DataType = reader.GetString(1) });
+                        columns.Add(new SQLColumn { Name = reader.GetString(0), DataType = reader.GetString(1), IsNullable = reader.GetString(2) == "YES" });
                     }
                 }
             }
