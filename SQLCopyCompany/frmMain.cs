@@ -149,7 +149,7 @@ namespace SQLCopyCompany
                 case "varchar":
                     return "''";
                 case "uniqueidentifier":
-                    return Guid.Empty.ToString();
+                    return $"'{Guid.Empty.ToString()}'";
                 case "varbinary":
                 case "image":
                     return "0x";
@@ -160,6 +160,7 @@ namespace SQLCopyCompany
         private void Go(object sender, DoWorkEventArgs e)
         {
             int maxLines = 500;
+            int timeout = 1200;
 
             var worker = (BackgroundWorker)sender;
 
@@ -186,17 +187,25 @@ namespace SQLCopyCompany
             {
                 intersectionTables.Add(table, ColumnsFromTable(sourceConnection, table, sourceCompany));
             }
+
+
             worker.ReportProgress(0, "Found intersection");
 
             int counter = 0;
             int cntTables = intersectionTables.Count;
 
             worker.ReportProgress(0, $"Started with sql, intersections: {cntTables}");
-            foreach (var kvp in intersectionTables)
+            foreach (var kvp in intersectionTables.SkipWhile(x => !x.Key.StartsWith("Prod_ Orderline")))
             {
                 var progress = (int)(100 * ((double)counter / (double)cntTables));
                 worker.ReportProgress(progress, $"{sourceCompany}${kvp.Key}");
 
+                if (chkDeleteOldData.Checked)
+                {
+                    var deleteSQL = $"DELETE FROM [{targetCompany}${kvp.Key}]";
+                    logString = deleteSQL;
+                    new SqlCommand(deleteSQL, targetConnection) { CommandTimeout = timeout }.ExecuteNonQuery();
+                }
 
                 int c2 = 0;
                 var insertSqls = new List<string>();
@@ -241,9 +250,20 @@ namespace SQLCopyCompany
                             c2++;
                             if (c2 % maxLines == 0)
                             {
-                                worker.ReportProgress(progress, $"{sourceCompany}${kvp.Key} | still working {c2} |");
+                                //worker.ReportProgress(progress, $"{sourceCompany}${kvp.Key} | still working {c2} |");
                                 insertSQL += string.Join($",{Environment.NewLine}", inserts);
-                                insertSqls.Add(insertSQL);
+                                //insertSqls.Add(insertSQL);
+
+                                worker.ReportProgress(progress, $"{sourceCompany}${kvp.Key} | Executing SQL {c2} |");
+                                logString = insertSQL;
+                                using (var cmd = targetConnection.CreateCommand())
+                                {
+                                    cmd.CommandText = insertSQL;
+                                    cmd.CommandTimeout = 0;
+                                    cmd.ExecuteNonQuery();
+                                    //new SqlCommand(insertSQL, targetConnection) { CommandTimeout = timeout }.ExecuteNonQuery();
+                                }
+                                worker.ReportProgress(progress, $"{sourceCompany}${kvp.Key} | Preparing SQL {c2} |");
                                 insertSQL = insertSQLStart;
                                 inserts.Clear();
                             }
@@ -251,28 +271,30 @@ namespace SQLCopyCompany
                         if (c2 % maxLines != 0)
                         {
                             insertSQL += string.Join($",{Environment.NewLine}", inserts);
-                            insertSqls.Add(insertSQL);
+                            logString = insertSQL;
+                            worker.ReportProgress(progress, $"{sourceCompany}${kvp.Key} | Executing SQL {c2} |");
+                            using (var cmd = targetConnection.CreateCommand())
+                            {
+                                cmd.CommandText = insertSQL;
+                                cmd.CommandTimeout = 0;
+                                cmd.ExecuteNonQuery();
+                                //new SqlCommand(insertSQL, targetConnection) { CommandTimeout = timeout }.ExecuteNonQuery();
+                            }
+                            worker.ReportProgress(progress, $"{sourceCompany}${kvp.Key} | Preparing SQL {c2} |");
                         }
                     }
                 }
 
 
 
-                if (chkDeleteOldData.Checked)
-                {
-                    var deleteSQL = $"DELETE FROM [{targetCompany}${kvp.Key}]";
-                    logString = deleteSQL;
-                    new SqlCommand(deleteSQL, targetConnection) { CommandTimeout = 600 }.ExecuteNonQuery();
-                }
-                int c3 = 0;
-                foreach (var insertSql in insertSqls)
-                {
-                    //log.Add(insertSql);
-                    logString = insertSql;
-                    worker.ReportProgress(progress, $"{sourceCompany}${kvp.Key} | still working {c3}/{c2} |");
-                    new SqlCommand(insertSql, targetConnection) { CommandTimeout = 600 }.ExecuteNonQuery();
-                    c3 += maxLines;
-                }
+
+                //int c3 = 0;
+                //foreach (var insertSql in insertSqls)
+                //{
+                //    //log.Add(insertSql);
+
+                //    c3 += maxLines;
+                //}
                 counter++;
                 worker.ReportProgress(progress, kvp.Key);
 
@@ -287,12 +309,12 @@ namespace SQLCopyCompany
                 case "image":
                 case "varchar":
                 case "datetime":
+                case "uniqueidentifier":
                     return $"'{value.Replace("'", "''")}'";
 
                 case "int":
                 case "timestamp":
                 case "varbinary":
-                case "uniqueidentifier":
                 case "tinyint":
                 case "bigint":
                     return $"{value}";
